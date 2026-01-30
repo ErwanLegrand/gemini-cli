@@ -405,7 +405,7 @@ export const AppContainer = (props: AppContainerProps) => {
         debugLogger.warn('Background summary generation failed:', e);
       });
     })();
-    registerCleanup(async () => {
+    const unregisterCleanup = registerCleanup(async () => {
       // Turn off mouse scroll.
       disableMouseEvents();
 
@@ -420,6 +420,10 @@ export const AppContainer = (props: AppContainerProps) => {
       // Fire SessionEnd hook on cleanup (only if hooks are enabled)
       await config?.getHookSystem()?.fireSessionEndEvent(SessionEndReason.Exit);
     });
+
+    return () => {
+      unregisterCleanup();
+    };
     // Disable the dependencies check here. historyManager gets flagged
     // but we don't want to react to changes to it because each new history
     // item, including the ones from the start session hook will cause a
