@@ -122,4 +122,34 @@ describe('cleanup', () => {
       await expect(cleanupCheckpoints()).resolves.not.toThrow();
     });
   });
+
+  describe('cleanup registry accumulation', () => {
+    it('simulates AppContainer lifecycle to verify cleanup accumulation behavior', async () => {
+      const cleanupAction = vi.fn();
+
+      // Mimic the useEffect hook state
+      let unregisterFn: (() => void) | void;
+
+      // Simulate "Mount"
+      // In AppContainer: const unregister = registerCleanup(...)
+      unregisterFn = registerCleanup(cleanupAction);
+
+      // Simulate "Update" (re-run effect)
+      // React calls cleanup from previous effect first
+      if (typeof unregisterFn === 'function') {
+        unregisterFn();
+      }
+
+      // Then runs the new effect
+      unregisterFn = registerCleanup(cleanupAction);
+
+      // Simulate "Exit"
+      await runExitCleanup();
+
+      // If the bug is present (no unregister capability or not used),
+      // accumulation would occur, resulting in 2 calls.
+      // With the fix, we expect only 1 call (the second registration).
+      expect(cleanupAction).toHaveBeenCalledTimes(1);
+    });
+  });
 });
