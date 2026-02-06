@@ -221,6 +221,7 @@ export class ToolExecutor {
           toolName,
           callId,
           this.config.storage.getProjectTempDir(),
+          this.config.getSessionId(),
         );
         outputFile = savedPath;
         content = formatTruncatedToolOutput(content, outputFile, lines);
@@ -253,6 +254,7 @@ export class ToolExecutor {
       errorType: undefined,
       outputFile,
       contentLength: typeof content === 'string' ? content.length : undefined,
+      data: toolResult.data,
     };
 
     const startTime = 'startTime' in call ? call.startTime : undefined;

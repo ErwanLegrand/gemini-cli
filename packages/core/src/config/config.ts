@@ -34,6 +34,8 @@ import { WebFetchTool } from '../tools/web-fetch.js';
 import { MemoryTool, setGeminiMdFilename } from '../tools/memoryTool.js';
 import { WebSearchTool } from '../tools/web-search.js';
 import { AskUserTool } from '../tools/ask-user.js';
+import { ExitPlanModeTool } from '../tools/exit-plan-mode.js';
+import { EnterPlanModeTool } from '../tools/enter-plan-mode.js';
 import { GeminiClient } from '../core/client.js';
 import { BaseLlmClient } from '../core/baseLlmClient.js';
 import type { HookDefinition, HookEventName } from '../hooks/types.js';
@@ -99,7 +101,7 @@ import { ApprovalMode, type PolicyEngineConfig } from '../policy/types.js';
 import { HookSystem } from '../hooks/index.js';
 import type { UserTierId } from '../code_assist/types.js';
 import type { RetrieveUserQuotaResponse } from '../code_assist/types.js';
-import type { FetchAdminControlsResponse } from '../code_assist/types.js';
+import type { AdminControlsSettings } from '../code_assist/types.js';
 import { getCodeAssistServer } from '../code_assist/codeAssist.js';
 import type { Experiments } from '../code_assist/experiments/experiments.js';
 import { AgentRegistry } from '../agents/registry.js';
@@ -147,6 +149,13 @@ export interface OutputSettings {
   format?: OutputFormat;
 }
 
+export interface ToolOutputMaskingConfig {
+  enabled: boolean;
+  toolProtectionThreshold: number;
+  minPrunableTokensThreshold: number;
+  protectLatestTurn: boolean;
+}
+
 export interface ExtensionSetting {
   name: string;
   description: string;
@@ -157,7 +166,7 @@ export interface ExtensionSetting {
 export interface ResolvedExtensionSetting {
   name: string;
   envVar: string;
-  value: string;
+  value?: string;
   sensitive: boolean;
   scope?: 'user' | 'workspace';
   source?: string;
@@ -271,6 +280,11 @@ import {
   DEFAULT_FILE_FILTERING_OPTIONS,
   DEFAULT_MEMORY_FILE_FILTERING_OPTIONS,
 } from './constants.js';
+import {
+  DEFAULT_TOOL_PROTECTION_THRESHOLD,
+  DEFAULT_MIN_PRUNABLE_TOKENS_THRESHOLD,
+  DEFAULT_PROTECT_LATEST_TURN,
+} from '../services/toolOutputMaskingService.js';
 
 import {
   type ExtensionLoader,
@@ -279,6 +293,10 @@ import {
 import { McpClientManager } from '../tools/mcp-client-manager.js';
 import type { EnvironmentSanitizationConfig } from '../services/environmentSanitization.js';
 import { getErrorMessage } from '../utils/errors.js';
+import {
+  ENTER_PLAN_MODE_TOOL_NAME,
+  EXIT_PLAN_MODE_TOOL_NAME,
+} from '../tools/tool-names.js';
 
 export type { FileFilteringOptions };
 export {
@@ -393,6 +411,7 @@ export interface ConfigParameters {
   includeDirectories?: string[];
   bugCommand?: BugCommandSettings;
   model: string;
+  disableLoopDetection?: boolean;
   maxSessionTurns?: number;
   experimentalZedIntegration?: boolean;
   listSessions?: boolean;
@@ -455,6 +474,7 @@ export interface ConfigParameters {
   disabledSkills?: string[];
   adminSkillsEnabled?: boolean;
   experimentalJitContext?: boolean;
+  toolOutputMasking?: Partial<ToolOutputMaskingConfig>;
   disableLLMCorrection?: boolean;
   plan?: boolean;
   onModelChange?: (model: string) => void;
@@ -531,6 +551,7 @@ export class Config {
   private readonly cwd: string;
   private readonly bugCommand: BugCommandSettings | undefined;
   private model: string;
+  private readonly disableLoopDetection: boolean;
   private previewFeatures: boolean | undefined;
   private hasAccessToPreviewModel: boolean = false;
   private readonly noBrowser: boolean;
@@ -591,6 +612,7 @@ export class Config {
   private pendingIncludeDirectories: string[];
   private readonly enableHooks: boolean;
   private readonly enableHooksUI: boolean;
+  private readonly toolOutputMasking: ToolOutputMaskingConfig;
   private hooks: { [K in HookEventName]?: HookDefinition[] } | undefined;
   private projectHooks:
     | ({ [K in HookEventName]?: HookDefinition[] } & { disabled?: string[] })
@@ -620,13 +642,16 @@ export class Config {
   private readonly planEnabled: boolean;
   private contextManager?: ContextManager;
   private terminalBackground: string | undefined = undefined;
-  private remoteAdminSettings: FetchAdminControlsResponse | undefined;
+  private remoteAdminSettings: AdminControlsSettings | undefined;
   private latestApiRequest: GenerateContentParameters | undefined;
   private lastModeSwitchTime: number = Date.now();
+
+  private approvedPlanPath: string | undefined;
 
   constructor(params: ConfigParameters) {
     this.sessionId = params.sessionId;
     this.clientVersion = params.clientVersion ?? 'unknown';
+    this.approvedPlanPath = undefined;
     this.embeddingModel =
       params.embeddingModel ?? DEFAULT_GEMINI_EMBEDDING_MODEL;
     this.fileSystemService = new StandardFileSystemService();
@@ -697,6 +722,7 @@ export class Config {
     this.fileDiscoveryService = params.fileDiscoveryService ?? null;
     this.bugCommand = params.bugCommand;
     this.model = params.model;
+    this.disableLoopDetection = params.disableLoopDetection ?? false;
     this._activeModel = params.model;
     this.enableAgents = params.enableAgents ?? false;
     this.agents = params.agents ?? {};
@@ -709,6 +735,18 @@ export class Config {
     this.modelAvailabilityService = new ModelAvailabilityService();
     this.previewFeatures = params.previewFeatures ?? undefined;
     this.experimentalJitContext = params.experimentalJitContext ?? false;
+    this.toolOutputMasking = {
+      enabled: params.toolOutputMasking?.enabled ?? false,
+      toolProtectionThreshold:
+        params.toolOutputMasking?.toolProtectionThreshold ??
+        DEFAULT_TOOL_PROTECTION_THRESHOLD,
+      minPrunableTokensThreshold:
+        params.toolOutputMasking?.minPrunableTokensThreshold ??
+        DEFAULT_MIN_PRUNABLE_TOKENS_THRESHOLD,
+      protectLatestTurn:
+        params.toolOutputMasking?.protectLatestTurn ??
+        DEFAULT_PROTECT_LATEST_TURN,
+    };
     this.maxSessionTurns = params.maxSessionTurns ?? -1;
     this.experimentalZedIntegration =
       params.experimentalZedIntegration ?? false;
@@ -914,6 +952,7 @@ export class Config {
         await this.getSkillManager().discoverSkills(
           this.storage,
           this.getExtensions(),
+          this.isTrustedFolder(),
         );
         this.getSkillManager().setDisabledSkills(this.disabledSkills);
 
@@ -939,6 +978,7 @@ export class Config {
     }
 
     await this.geminiClient.initialize();
+    this.syncPlanModeTools();
   }
 
   getContentGenerator(): ContentGenerator {
@@ -1021,7 +1061,7 @@ export class Config {
       codeAssistServer,
       this.getRemoteAdminSettings(),
       adminControlsEnabled,
-      (newSettings: FetchAdminControlsResponse) => {
+      (newSettings: AdminControlsSettings) => {
         this.setRemoteAdminSettings(newSettings);
         coreEvents.emitAdminSettingsChanged();
       },
@@ -1042,8 +1082,7 @@ export class Config {
   }
 
   getUserTierName(): string | undefined {
-    // TODO(#1275): Re-enable user tier display when ready.
-    return undefined;
+    return this.contentGenerator?.userTierName;
   }
 
   /**
@@ -1090,11 +1129,11 @@ export class Config {
     this.latestApiRequest = req;
   }
 
-  getRemoteAdminSettings(): FetchAdminControlsResponse | undefined {
+  getRemoteAdminSettings(): AdminControlsSettings | undefined {
     return this.remoteAdminSettings;
   }
 
-  setRemoteAdminSettings(settings: FetchAdminControlsResponse): void {
+  setRemoteAdminSettings(settings: AdminControlsSettings): void {
     this.remoteAdminSettings = settings;
   }
 
@@ -1116,6 +1155,10 @@ export class Config {
 
   getModel(): string {
     return this.model;
+  }
+
+  getDisableLoopDetection(): boolean {
+    return this.disableLoopDetection ?? false;
   }
 
   setModel(newModel: string, isTemporary: boolean = true): void {
@@ -1428,6 +1471,14 @@ export class Config {
     return this.experimentalJitContext;
   }
 
+  getToolOutputMaskingEnabled(): boolean {
+    return this.toolOutputMasking.enabled;
+  }
+
+  getToolOutputMaskingConfig(): ToolOutputMaskingConfig {
+    return this.toolOutputMasking;
+  }
+
   getGeminiMdFileCount(): number {
     if (this.experimentalJitContext && this.contextManager) {
       return this.contextManager.getLoadedPaths().size;
@@ -1477,7 +1528,38 @@ export class Config {
       currentMode !== mode &&
       (currentMode === ApprovalMode.PLAN || mode === ApprovalMode.PLAN);
     if (isPlanModeTransition) {
+      this.syncPlanModeTools();
       this.updateSystemInstructionIfInitialized();
+    }
+  }
+
+  /**
+   * Synchronizes enter/exit plan mode tools based on current mode.
+   */
+  syncPlanModeTools(): void {
+    const isPlanMode = this.getApprovalMode() === ApprovalMode.PLAN;
+    const registry = this.getToolRegistry();
+
+    if (isPlanMode) {
+      if (registry.getTool(ENTER_PLAN_MODE_TOOL_NAME)) {
+        registry.unregisterTool(ENTER_PLAN_MODE_TOOL_NAME);
+      }
+      if (!registry.getTool(EXIT_PLAN_MODE_TOOL_NAME)) {
+        registry.registerTool(new ExitPlanModeTool(this, this.messageBus));
+      }
+    } else {
+      if (registry.getTool(EXIT_PLAN_MODE_TOOL_NAME)) {
+        registry.unregisterTool(EXIT_PLAN_MODE_TOOL_NAME);
+      }
+      if (!registry.getTool(ENTER_PLAN_MODE_TOOL_NAME)) {
+        registry.registerTool(new EnterPlanModeTool(this, this.messageBus));
+      }
+    }
+
+    if (this.geminiClient?.isInitialized()) {
+      this.geminiClient.setTools().catch((err) => {
+        debugLogger.error('Failed to update tools', err);
+      });
     }
   }
 
@@ -1698,6 +1780,14 @@ export class Config {
     return this.planEnabled;
   }
 
+  getApprovedPlanPath(): string | undefined {
+    return this.approvedPlanPath;
+  }
+
+  setApprovedPlanPath(path: string | undefined): void {
+    this.approvedPlanPath = path;
+  }
+
   isAgentsEnabled(): boolean {
     return this.enableAgents;
   }
@@ -1768,10 +1858,6 @@ export class Config {
    * @returns true if the path is allowed, false otherwise.
    */
   isPathAllowed(absolutePath: string): boolean {
-    if (this.interactive && path.isAbsolute(absolutePath)) {
-      return true;
-    }
-
     const realpath = (p: string) => {
       let resolved: string;
       try {
@@ -1916,6 +2002,7 @@ export class Config {
       await this.getSkillManager().discoverSkills(
         this.storage,
         this.getExtensions(),
+        this.isTrustedFolder(),
       );
       this.getSkillManager().setDisabledSkills(this.disabledSkills);
 
@@ -2132,6 +2219,10 @@ export class Config {
     registerCoreTool(AskUserTool);
     if (this.getUseWriteTodos()) {
       registerCoreTool(WriteTodosTool);
+    }
+    if (this.isPlanEnabled()) {
+      registerCoreTool(ExitPlanModeTool, this);
+      registerCoreTool(EnterPlanModeTool, this);
     }
 
     // Register Subagents as Tools
